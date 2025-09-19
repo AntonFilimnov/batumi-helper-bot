@@ -39,3 +39,6 @@ venv.bak
 # IDEs and editors
 .idea/
 .vscode/
+
+# Папка с векторной базой данных
+chroma/

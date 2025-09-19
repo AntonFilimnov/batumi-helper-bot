@@ -1,79 +1,110 @@
 import os
-import uvicorn
-import telegram
 from fastapi import FastAPI, Request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, ContextTypes, MessageHandler, filters, CommandHandler
 from dotenv import load_dotenv
 
-# --- Загрузка конфигурации ---
+# --- НОВЫЕ ИМПОРТЫ ДЛЯ AI ---
+from langchain_chroma import Chroma
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.schema.runnable import RunnablePassthrough
+from langchain.schema.output_parser import StrOutputParser
+
+# Загружаем переменные окружения
 load_dotenv()
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# Вставь сюда свой актуальный URL из ngrok!
-WEBHOOK_URL = "https://f7bffee77ee0.ngrok-free.app"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+CHROMA_PATH = "chroma" # Путь к нашей базе знаний
 
-# --- "Ручная" база знаний ---
-KNOWLEDGE_BASE = {
-    "внж": "Для получения ВНЖ в Грузии нужно собрать пакет документов, включая...\n1. Заявление\n2. Копия паспорта\n3. Справка о доходах...",
-    "ип": "Регистрация ИП происходит в Доме Юстиции и занимает около 1 дня. Вам понадобится..."
-}
+# --- ИНИЦИАЛИЗАЦИЯ AI-ЛОГИКИ (ПРИ СТАРТЕ БОТА) ---
 
-# --- Логика бота ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
-    await update.message.reply_text("Привет! Я твой помощник по Батуми. Спроси меня про 'ВНЖ' или 'ИП'.")
+# 1. Создаем шаблон промпта
+# Мы даем модели инструкцию и указываем, куда подставлять контекст и вопрос
+PROMPT_TEMPLATE = """
+Отвечай на вопрос только на основе следующего контекста:
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений."""
-    user_text = update.message.text.lower()
-    print(f"User message received: '{user_text}'")
+{context}
 
-    response = "Извини, я пока не знаю ответа на этот вопрос. Попробуй спросить про 'ВНЖ' или 'ИП'."
-    for key in KNOWLEDGE_BASE:
-        if key in user_text:
-            response = KNOWLEDGE_BASE[key]
-            break
-    
-    print(f"Replying with: '{response}'")
-    await update.message.reply_text(response)
+---
 
-# --- Настройка FastAPI и Webhook ---
-# Инициализируем приложение Telegram Bot ПЕРЕД запуском FastAPI
-application = (
-    Application.builder()
-    .token(TELEGRAM_BOT_TOKEN)
-    .build()
+Ответь на вопрос на основе контекста выше: {question}
+"""
+prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+
+# 2. Подключаемся к существующей базе данных Chroma
+# и создаем "ретривер" - объект, который умеет извлекать из нее данные
+embedding_function = OpenAIEmbeddings()
+vectorstore = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
+retriever = vectorstore.as_retriever()
+
+# 3. Инициализируем языковую модель
+llm = ChatOpenAI()
+
+# 4. Собираем все в единую цепочку (RAG chain)
+# Это "конвейер", по которому проходит запрос пользователя
+rag_chain = (
+    {"context": retriever, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
 )
 
-# Создаем FastAPI-приложение
+# --- КОНЕЦ БЛОКА ИНИЦИАЛИЗАЦИИ AI ---
+
+
+# Создаем веб-сервер и приложение бота
 app = FastAPI()
+application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+
+# --- ОБНОВЛЕННЫЕ ОБРАБОТЧИКИ КОМАНД ---
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает команду /start."""
+    welcome_text = "Привет! Я AI-консьерж по Батуми. Я знаю немного о ВНЖ и регистрации ИП. Задай мне свой вопрос."
+    await update.message.reply_text(welcome_text)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает обычные текстовые сообщения с помощью RAG."""
+    if not update.message or not update.message.text:
+        return
+    
+    user_question = update.message.text
+    
+    # Отправляем вопрос в нашу RAG-цепочку и получаем ответ
+    ai_response = rag_chain.invoke(user_question)
+    
+    await update.message.reply_text(ai_response)
+
+# --- КОД ДЛЯ ЗАПУСКА СЕРВЕРА (БЕЗ ИЗМЕНЕНИЙ) ---
 
 @app.on_event("startup")
-async def startup_event():
-    """Эта функция выполняется один раз при старте сервера."""
-    print("Starting up...")
-    # Регистрируем обработчики команд
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # --- ДОБАВЬ ЭТУ СТРОЧКУ ---
-    await application.initialize() # <--- ВОТ ОНА, НАША ИНИЦИАЛИЗАЦИЯ
-    # --------------------------
-    
-    # Устанавливаем вебхук
+async def startup():
+    await application.initialize()
+    await application.start()
+    if not WEBHOOK_URL:
+        raise ValueError("WEBHOOK_URL not set in .env file")
     await application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
     print(f"Webhook set to {WEBHOOK_URL}/webhook")
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Эта функция выполняется при остановке сервера."""
-    print("Shutting down...")
-    await application.bot.delete_webhook()
-
 @app.post("/webhook")
-async def webhook(request: Request):
-    """Эта 'ручка' принимает обновления от Telegram."""
-    await application.process_update(
-        Update.de_json(data=await request.json(), bot=application.bot)
-    )
+async def webhook_handler(request: Request):
+    try:
+        update_data = await request.json()
+        update = Update.de_json(data=update_data, bot=application.bot)
+        await application.update_queue.put(update)
+    except Exception as e:
+        print(f"Error processing update: {e}")
     return {"status": "ok"}
+
+@app.on_event("shutdown")
+async def shutdown():
+    await application.stop()
+    await application.bot.delete_webhook()
+    print("Webhook deleted.")
+
+application.add_handler(CommandHandler("start", start_command))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

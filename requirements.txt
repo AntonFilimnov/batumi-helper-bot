@@ -1,4 +1,17 @@
+
+
+# Старые зависимости
 fastapi
 uvicorn[standard]
 python-telegram-bot[ext]
 python-dotenv
+
+# Новые зависимости для AI
+langchain
+langchain-community # <-- ДОБАВИТЬ
+langchain-openai    # <-- ДОБАВИТЬ
+openai
+chromadb
+tiktoken
+unstructured
+langchain-chroma
