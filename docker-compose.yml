@@ -5,16 +5,13 @@ services:
       - "8000:8000"
     env_file:
       - .env
-    # Присоединяем наш сервис к новой сети
     networks:
       - bot-net
 
-# --- НОВЫЙ БЛОК КОНФИГУРАЦИИ СЕТИ ---
 networks:
   bot-net:
     driver: bridge
     ipam:
       config:
         - subnet: 172.20.0.0/24
-    # Эта опция отключает IPv6 для данной сети
     enable_ipv6: false

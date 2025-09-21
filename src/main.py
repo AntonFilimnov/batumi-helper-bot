@@ -1,85 +1,91 @@
+# src/main.py
 import os
 from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters, CommandHandler
 from dotenv import load_dotenv
 
-# --- НОВЫЕ ИМПОРТЫ ДЛЯ AI ---
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from operator import itemgetter
 
-# Загружаем переменные окружения
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-CHROMA_PATH = "chroma" # Путь к нашей базе знаний
+CHROMA_PATH = "chroma"
 
-# --- ИНИЦИАЛИЗАЦИЯ AI-ЛОГИКИ (ПРИ СТАРТЕ БОТА) ---
+chat_histories = {}
 
-# 1. Создаем шаблон промпта
-# Мы даем модели инструкцию и указываем, куда подставлять контекст и вопрос
-PROMPT_TEMPLATE = """
-Отвечай на вопрос только на основе следующего контекста:
+def get_session_history(session_id: str) -> ChatMessageHistory:
+    if session_id not in chat_histories:
+        chat_histories[session_id] = ChatMessageHistory()
+    return chat_histories[session_id]
 
-{context}
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "Отвечай на вопрос только на основе следующего контекста:\n\n{context}"),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{question}"),
+    ]
+)
 
----
-
-Ответь на вопрос на основе контекста выше: {question}
-"""
-prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-
-# 2. Подключаемся к существующей базе данных Chroma
-# и создаем "ретривер" - объект, который умеет извлекать из нее данные
 embedding_function = OpenAIEmbeddings()
 vectorstore = Chroma(persist_directory=CHROMA_PATH, embedding_function=embedding_function)
 retriever = vectorstore.as_retriever()
-
-# 3. Инициализируем языковую модель
 llm = ChatOpenAI()
 
-# 4. Собираем все в единую цепочку (RAG chain)
-# Это "конвейер", по которому проходит запрос пользователя
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# --- ИСПРАВЛЕННАЯ RAG-ЦЕПОЧКА ---
 rag_chain = (
-    {"context": retriever, "question": RunnablePassthrough()}
+    {
+        "context": itemgetter("question") | retriever | format_docs,
+        "question": itemgetter("question"),
+        "history": itemgetter("history"), # <-- ВОТ ОНА, НЕДОСТАЮЩАЯ СТРОКА!
+    }
     | prompt
     | llm
     | StrOutputParser()
 )
 
-# --- КОНЕЦ БЛОКА ИНИЦИАЛИЗАЦИИ AI ---
+conversational_rag_chain = RunnableWithMessageHistory(
+    rag_chain,
+    get_session_history,
+    input_messages_key="question",
+    history_messages_key="history",
+)
 
+# --- КОНЕЦ БЛОКА ИНИЦИАЛИЗАЦИИ ---
 
-# Создаем веб-сервер и приложение бота
 app = FastAPI()
 application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-
-# --- ОБНОВЛЕННЫЕ ОБРАБОТЧИКИ КОМАНД ---
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает команду /start."""
-    welcome_text = "Привет! Я AI-консьерж по Батуми. Я знаю немного о ВНЖ и регистрации ИП. Задай мне свой вопрос."
-    await update.message.reply_text(welcome_text)
-
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает обычные текстовые сообщения с помощью RAG."""
     if not update.message or not update.message.text:
         return
     
     user_question = update.message.text
+    chat_id = str(update.message.chat_id)
     
-    # Отправляем вопрос в нашу RAG-цепочку и получаем ответ
-    ai_response = rag_chain.invoke(user_question)
+    # Теперь этот вызов корректен, т.к. наша цепочка ожидает словарь
+    ai_response = conversational_rag_chain.invoke(
+        {"question": user_question, "history": []}, # Добавляем пустую историю в первый вызов
+        config={"configurable": {"session_id": chat_id}}
+    )
     
     await update.message.reply_text(ai_response)
 
-# --- КОД ДЛЯ ЗАПУСКА СЕРВЕРА (БЕЗ ИЗМЕНЕНИЙ) ---
+# Остальной код без изменений
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = "Привет! Я AI-консьерж по Батуми. Я помню наш диалог. Задай мне свой вопрос."
+    await update.message.reply_text(welcome_text)
 
 @app.on_event("startup")
 async def startup():
